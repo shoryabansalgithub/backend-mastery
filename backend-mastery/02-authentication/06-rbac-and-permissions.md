@@ -856,6 +856,255 @@ function requirePermission(permission: Permission) {
 
 ---
 
+## ABAC: Attribute-Based Access Control
+
+### When RBAC Isn't Enough
+
+RBAC assigns permissions based on roles. But sometimes you need more
+nuanced access decisions:
+
+- "Doctors can only view records for patients in their department"
+- "Users can only edit documents created in the last 24 hours"
+- "Requests from internal IPs can access admin routes"
+- "Free-tier users can create up to 5 projects"
+
+These rules depend on **attributes** of the user, resource, action, and
+environment — not just the user's role. This is ABAC.
+
+### RBAC vs ABAC
+
+| Aspect | RBAC | ABAC |
+|--------|------|------|
+| Decision based on | User's role | Attributes of user, resource, action, context |
+| Flexibility | Moderate | Very high |
+| Complexity | Low | Higher |
+| Policy count | Few | Can grow large |
+| Auditing | Easy | Harder (more variables) |
+| Example | "Admins can delete posts" | "Authors can edit their own posts created less than 1 hour ago" |
+
+### Implementing ABAC
+
+```typescript
+interface ABACContext {
+  user: {
+    id: string;
+    role: string;
+    department?: string;
+    tier?: 'free' | 'pro' | 'enterprise';
+    attributes: Record<string, unknown>;
+  };
+  resource: {
+    type: string;
+    ownerId?: string;
+    createdAt?: number;
+    attributes: Record<string, unknown>;
+  };
+  action: string;
+  environment: {
+    ip: string;
+    time: number;
+    isInternal: boolean;
+  };
+}
+
+type PolicyResult = 'allow' | 'deny' | 'abstain';
+
+interface Policy {
+  name: string;
+  description: string;
+  evaluate(context: ABACContext): PolicyResult;
+}
+
+// Policy: Resource owners can always edit their resources
+const ownerCanEdit: Policy = {
+  name: 'owner-edit',
+  description: 'Resource owners can edit their own resources',
+  evaluate(ctx) {
+    if (ctx.action !== 'edit') return 'abstain';
+    if (ctx.resource.ownerId === ctx.user.id) return 'allow';
+    return 'abstain';
+  },
+};
+
+// Policy: Free tier users limited to 5 projects
+const freeTierLimit: Policy = {
+  name: 'free-tier-limit',
+  description: 'Free tier users can create up to 5 projects',
+  evaluate(ctx) {
+    if (ctx.action !== 'create' || ctx.resource.type !== 'project') return 'abstain';
+    if (ctx.user.tier !== 'free') return 'abstain';
+    const projectCount = ctx.user.attributes.projectCount as number;
+    if (projectCount >= 5) return 'deny';
+    return 'abstain';
+  },
+};
+
+// Policy: Only internal IPs can access admin routes
+const internalAdminOnly: Policy = {
+  name: 'internal-admin',
+  description: 'Admin routes require internal network access',
+  evaluate(ctx) {
+    if (!ctx.action.startsWith('admin:')) return 'abstain';
+    if (!ctx.environment.isInternal) return 'deny';
+    return 'abstain';
+  },
+};
+
+// Policy: Documents can only be edited within 24 hours of creation
+const editTimeLimit: Policy = {
+  name: 'edit-time-limit',
+  description: 'Documents can only be edited within 24 hours',
+  evaluate(ctx) {
+    if (ctx.action !== 'edit' || ctx.resource.type !== 'document') return 'abstain';
+    if (!ctx.resource.createdAt) return 'abstain';
+    const ageMs = ctx.environment.time - ctx.resource.createdAt;
+    if (ageMs > 24 * 60 * 60 * 1000) return 'deny';
+    return 'abstain';
+  },
+};
+```
+
+---
+
+## Policy Engines
+
+### How Policy Evaluation Works
+
+A policy engine evaluates multiple policies and combines their results:
+
+```typescript
+class PolicyEngine {
+  private policies: Policy[] = [];
+
+  register(policy: Policy): void {
+    this.policies.push(policy);
+  }
+
+  evaluate(context: ABACContext): { allowed: boolean; reason: string } {
+    let hasAllow = false;
+    let denyReason = '';
+
+    for (const policy of this.policies) {
+      const result = policy.evaluate(context);
+
+      if (result === 'deny') {
+        // Deny always wins — any explicit deny blocks the action
+        return {
+          allowed: false,
+          reason: `Denied by policy: ${policy.name} (${policy.description})`,
+        };
+      }
+
+      if (result === 'allow') {
+        hasAllow = true;
+      }
+    }
+
+    // Must have at least one explicit allow
+    if (hasAllow) {
+      return { allowed: true, reason: 'Allowed by policy' };
+    }
+
+    return { allowed: false, reason: 'No policy granted access' };
+  }
+}
+
+// Usage
+const engine = new PolicyEngine();
+engine.register(ownerCanEdit);
+engine.register(freeTierLimit);
+engine.register(internalAdminOnly);
+engine.register(editTimeLimit);
+
+// Check access
+const result = engine.evaluate({
+  user: { id: 'user_42', role: 'member', tier: 'free', attributes: { projectCount: 3 } },
+  resource: { type: 'document', ownerId: 'user_42', createdAt: Date.now() - 3600_000, attributes: {} },
+  action: 'edit',
+  environment: { ip: '10.0.0.5', time: Date.now(), isInternal: true },
+});
+
+console.log(result);
+// { allowed: true, reason: 'Allowed by policy' }
+```
+
+### Policy Evaluation Strategies
+
+Different engines combine policy results differently:
+
+```
+1. Deny-overrides (most common):
+   Any DENY → denied
+   At least one ALLOW → allowed
+   No opinion → denied
+
+2. Allow-overrides:
+   Any ALLOW → allowed
+   At least one DENY → denied  (but allow wins)
+   No opinion → denied
+
+3. First-applicable:
+   First policy that returns allow/deny wins
+   Order matters
+
+4. Unanimous:
+   ALL policies must ALLOW
+   Any deny or abstain → denied
+```
+
+### Express Middleware with ABAC
+
+```typescript
+function abacGuard(action: string, getResource?: (req: Request) => ABACContext['resource']) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const context: ABACContext = {
+      user: {
+        id: req.user.userId,
+        role: req.user.role,
+        tier: req.user.tier,
+        department: req.user.department,
+        attributes: req.user.attributes || {},
+      },
+      resource: getResource
+        ? getResource(req)
+        : { type: 'endpoint', attributes: {} },
+      action,
+      environment: {
+        ip: req.ip,
+        time: Date.now(),
+        isInternal: req.ip.startsWith('10.') || req.ip.startsWith('192.168.'),
+      },
+    };
+
+    const result = engine.evaluate(context);
+
+    if (!result.allowed) {
+      return res.status(403).json({ error: result.reason });
+    }
+
+    next();
+  };
+}
+
+// Usage
+app.put(
+  '/documents/:id',
+  authenticate,
+  abacGuard('edit', async (req) => {
+    const doc = await getDocument(req.params.id);
+    return {
+      type: 'document',
+      ownerId: doc.authorId,
+      createdAt: doc.createdAt,
+      attributes: { status: doc.status },
+    };
+  }),
+  updateDocument
+);
+```
+
+---
+
 ## Exercises
 
 ### Exercise 1: RBAC System

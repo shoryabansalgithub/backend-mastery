@@ -384,6 +384,201 @@ or if you're maintaining a legacy system.
 
 ---
 
+## Peppering: The Secret Salt
+
+### What Is a Pepper?
+
+A salt is stored alongside the hash (it's not secret). A **pepper** is a
+secret value, stored SEPARATELY from the database — typically in an
+environment variable or a secrets manager.
+
+```
+hash(salt + password)           ← salt only
+hash(salt + password + pepper)  ← salt + pepper
+```
+
+### Why Pepper?
+
+Salt protects against rainbow tables. Pepper protects against **database
+theft**. If an attacker steals your database, they get the salts (stored
+next to each hash) but NOT the pepper (stored in application config).
+Without the pepper, they can't verify any password guesses.
+
+### Implementing Peppering
+
+```typescript
+import argon2 from 'argon2';
+import { createHmac } from 'node:crypto';
+
+// Pepper is stored in environment, NOT in the database
+const PEPPER = process.env.PASSWORD_PEPPER!;
+
+// Pre-hash the password with the pepper using HMAC
+// Then feed the result to argon2
+function pepperPassword(password: string): string {
+  return createHmac('sha256', PEPPER).update(password).digest('hex');
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const peppered = pepperPassword(password);
+  return argon2.hash(peppered, {
+    type: argon2.argon2id,
+    memoryCost: 65536,
+    timeCost: 3,
+    parallelism: 4,
+  });
+}
+
+async function verifyPassword(password: string, hash: string): Promise<boolean> {
+  const peppered = pepperPassword(password);
+  return argon2.verify(hash, peppered);
+}
+```
+
+### Pepper Rotation
+
+If you suspect the pepper is compromised, you need to re-hash all passwords.
+Unlike salt (which is per-user), a pepper change affects everyone:
+
+```typescript
+// Version the pepper
+const PEPPERS: Record<number, string> = {
+  1: process.env.PASSWORD_PEPPER_V1!,
+  2: process.env.PASSWORD_PEPPER_V2!,  // Current version
+};
+const CURRENT_PEPPER_VERSION = 2;
+
+// Store the pepper version alongside the hash
+// Users on old pepper versions get re-hashed on next login
+```
+
+**Trade-off:** Peppering adds complexity. For most applications, argon2
+with proper cost parameters provides sufficient security. Peppering is
+defense-in-depth for high-security scenarios (banking, healthcare, government).
+
+---
+
+## scrypt: The Memory-Hard Middle Ground
+
+### Where scrypt Fits
+
+scrypt was designed by Colin Percival in 2009, before argon2 existed.
+It's memory-hard (like argon2) and is available in Node's built-in
+`crypto` module — no additional dependencies needed.
+
+```typescript
+import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+
+function hashPassword(password: string): string {
+  const salt = randomBytes(16);
+  const hash = scryptSync(password, salt, 64, {
+    N: 16384,   // CPU/memory cost (must be power of 2)
+    r: 8,       // Block size
+    p: 1,       // Parallelism
+    maxmem: 128 * 16384 * 8 * 2,  // Memory limit
+  });
+  // Store salt and hash together
+  return `${salt.toString('hex')}:${hash.toString('hex')}`;
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  const [saltHex, hashHex] = stored.split(':');
+  const salt = Buffer.from(saltHex, 'hex');
+  const storedHash = Buffer.from(hashHex, 'hex');
+
+  const hash = scryptSync(password, salt, 64, {
+    N: 16384,
+    r: 8,
+    p: 1,
+    maxmem: 128 * 16384 * 8 * 2,
+  });
+
+  return timingSafeEqual(hash, storedHash);
+}
+```
+
+### scrypt vs bcrypt vs argon2
+
+| Property | bcrypt | scrypt | argon2id |
+|----------|--------|--------|----------|
+| Year | 1999 | 2009 | 2015 |
+| Memory-hard | No | Yes | Yes |
+| Built into Node | No (npm) | **Yes** (crypto) | No (npm) |
+| Max password length | 72 bytes | Unlimited | Unlimited |
+| Tuning parameters | 1 (cost) | 3 (N, r, p) | 3 (memory, time, parallelism) |
+| Competition winner | N/A | N/A | **Yes** (PHC 2015) |
+
+**When to use scrypt:** When you want memory-hard hashing without
+installing external dependencies (it's in Node's `crypto` module).
+
+---
+
+## Credential Stuffing Protection
+
+### The Unique Threat
+
+Credential stuffing is different from brute force. Attackers don't guess
+passwords — they use REAL username/password pairs stolen from OTHER sites.
+Because password reuse is epidemic, these attacks have a 0.1-2% success
+rate across billions of credentials.
+
+### Defense 1: Breached Password Checking (HIBP)
+
+Check if the user's password appears in known breach databases at
+registration AND password change:
+
+```typescript
+import { createHash } from 'node:crypto';
+
+async function isPasswordBreached(password: string): Promise<boolean> {
+  // Use k-Anonymity: only send the first 5 chars of the SHA-1 hash
+  const hash = createHash('sha1').update(password).digest('hex').toUpperCase();
+  const prefix = hash.slice(0, 5);
+  const suffix = hash.slice(5);
+
+  const response = await fetch(
+    `https://api.pwnedpasswords.com/range/${prefix}`,
+    { headers: { 'User-Agent': 'YourApp/1.0' } }
+  );
+  const text = await response.text();
+
+  // Response is a list of hash suffixes with breach counts
+  return text.split('\r\n').some(line => {
+    const [hashSuffix] = line.split(':');
+    return hashSuffix === suffix;
+  });
+}
+
+// In registration/password change
+async function validateNewPassword(password: string): Promise<string[]> {
+  const errors: string[] = [];
+
+  if (password.length < 8) {
+    errors.push('Password must be at least 8 characters');
+  }
+
+  const breached = await isPasswordBreached(password);
+  if (breached) {
+    errors.push('This password has appeared in a data breach. Choose another.');
+  }
+
+  return errors;
+}
+```
+
+### Defense 2: Rate Limiting by Multiple Dimensions
+
+See Lesson 7 (Security Attacks & Defenses) for comprehensive rate limiting
+strategies that cover IP-based, email-based, and combined limiting.
+
+### Defense 3: Require MFA
+
+MFA is the single most effective defense against credential stuffing.
+Even if the attacker has the correct password, they don't have the
+second factor. See Lesson 9 (Advanced Auth Systems) for implementation.
+
+---
+
 ## Timing Attacks on Password Comparison
 
 We touched on this in the previous lesson, but it's so important for

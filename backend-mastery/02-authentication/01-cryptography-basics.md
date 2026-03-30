@@ -151,6 +151,56 @@ you're verifying a software download. If an attacker can create a malicious
 file with the same MD5 hash as the legitimate file, your integrity check
 is worthless. The same logic applies to digital signatures and certificates.
 
+### SHA-3 (Keccak): The Insurance Policy
+
+SHA-3 was standardized by NIST in 2015 as a backup for SHA-2. It's not
+that SHA-2 is broken — it's that SHA-3 uses a completely different internal
+design (called the "sponge construction" based on the Keccak algorithm).
+
+Why does this matter? If someone discovers a structural weakness in SHA-2's
+Merkle-Damgård construction, SHA-3 wouldn't be affected because it works
+differently. It's cryptographic biodiversity.
+
+```typescript
+import { createHash } from 'node:crypto';
+
+// SHA-3 variants
+const sha3_256 = createHash('sha3-256').update('hello').digest('hex');
+const sha3_512 = createHash('sha3-512').update('hello').digest('hex');
+
+console.log('SHA-3-256:', sha3_256);
+// 3338be694f50c5f338814986cdf0686453a888b84f424d792af4b9202398f392
+
+console.log('SHA-3-512:', sha3_512);
+// 75d527c368f2efe848ecf6b073a36767800805e9eef2b1857d5f984f036eb6df...
+
+// Compare with SHA-2
+const sha2_256 = createHash('sha256').update('hello').digest('hex');
+console.log('SHA-2-256:', sha2_256);
+// 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+// Same input, completely different hash — different algorithms
+```
+
+Key differences from SHA-2:
+
+| Property | SHA-2 | SHA-3 |
+|---------|-------|-------|
+| Internal structure | Merkle-Damgård | Sponge (Keccak) |
+| Length extension attack | Vulnerable | **Immune** |
+| Hardware performance | Faster (widely optimized) | Slower (newer) |
+| Software performance | Fast | Comparable |
+| Adoption | Ubiquitous | Growing |
+
+The length extension vulnerability is worth understanding: with SHA-2,
+if you know `SHA256(message)` and the length of `message`, you can compute
+`SHA256(message || attacker_data)` without knowing `message`. This is why
+HMAC exists (it prevents this attack). SHA-3 is immune to this by design.
+
+**When to use SHA-3:** If your threat model requires defense-in-depth
+against theoretical future breaks in SHA-2, or if you need immunity to
+length extension attacks without using HMAC. For most applications,
+SHA-256 remains the standard choice.
+
 ---
 
 ## Symmetric Encryption: One Key to Rule Them All
@@ -606,6 +656,99 @@ primitives:
 
 ---
 
+## Why Cryptography Fails in Implementation, Not Theory
+
+The algorithms themselves are solid. SHA-256 hasn't been broken. AES hasn't
+been broken. RSA with proper key sizes hasn't been broken. What breaks is
+how developers USE these algorithms.
+
+Here are the most common implementation failures, ranked by how often they
+cause real-world breaches:
+
+### 1. Using Crypto for the Wrong Purpose
+
+```typescript
+// WRONG: Encrypting passwords (should be hashing)
+const encryptedPassword = encrypt(password, key);
+// If the key leaks, ALL passwords are exposed instantly
+
+// WRONG: Hashing data you need to retrieve (should be encrypting)
+const hashedCreditCard = sha256(creditCard);
+// One-way — you can never get the credit card back
+
+// WRONG: Using encoding for security (not cryptographic at all)
+const "secured" = Buffer.from(password).toString('base64');
+// Anyone can decode this
+```
+
+### 2. Rolling Your Own Crypto
+
+```typescript
+// WRONG: Custom "encryption" algorithm
+function myEncrypt(text: string, key: string): string {
+  return text.split('').map((char, i) =>
+    String.fromCharCode(char.charCodeAt(0) ^ key.charCodeAt(i % key.length))
+  ).join('');
+}
+// This is a simple XOR cipher. It's trivially breakable.
+```
+
+### 3. Reusing IVs/Nonces
+
+```typescript
+// WRONG: Hardcoded IV
+const iv = Buffer.from('1234567890123456');
+// Reusing an IV with the same key in AES-GCM is catastrophic.
+// It allows an attacker to recover the encryption key.
+
+// RIGHT: Random IV for every encryption
+const iv = randomBytes(12);
+```
+
+### 4. Weak Keys and Secrets
+
+```typescript
+// WRONG: Predictable keys
+const key = 'secret';                      // Dictionary-attackable
+const key = 'my-app-key-2024';             // Guessable
+const key = sha256('my-password');          // Password-derived without KDF
+
+// RIGHT: Cryptographically random keys
+const key = randomBytes(32);               // 256 bits of entropy
+const key = scryptSync(password, salt, 32); // Proper KDF for password-derived keys
+```
+
+### 5. Comparing Secrets with === (Timing Attacks)
+
+```typescript
+// WRONG: Early-exit comparison
+if (userToken === storedToken) { /* ... */ }
+// Leaks information about which bytes match
+
+// RIGHT: Constant-time comparison
+if (timingSafeEqual(Buffer.from(userToken), Buffer.from(storedToken))) { /* ... */ }
+```
+
+### 6. Not Validating Cryptographic Output
+
+```typescript
+// WRONG: Not checking the authentication tag in AES-GCM
+try {
+  const plaintext = decrypt(ciphertext, key);
+  // If the tag verification fails, this data may have been tampered with
+  // but some implementations silently return garbage
+} catch (err) {
+  // This error is CRITICAL — it means tampering was detected
+  // But developers often swallow it
+}
+```
+
+The lesson: **understand the primitive, understand its guarantees and
+limitations, and use it exactly as designed.** Cryptography is not a
+black box you can creatively adapt.
+
+---
+
 ## Randomness: The Unsung Hero
 
 All of cryptography depends on good random numbers. If your random number
@@ -633,16 +776,54 @@ seed. Node's `crypto.randomBytes` uses the operating system's CSPRNG
 (cryptographically secure PRNG), which gathers entropy from hardware
 events.
 
+### CSPRNG vs PRNG: The Critical Difference
+
+| Property | PRNG (Math.random) | CSPRNG (crypto.randomBytes) |
+|----------|-------------------|-----------------------------|
+| Seed | Single value (often time-based) | OS entropy pool (hardware events, interrupts) |
+| Predictable? | Yes — if seed is known | No — computationally infeasible |
+| Output quality | Statistically random | Cryptographically random |
+| Speed | Very fast | Slightly slower |
+| Use case | Games, simulations | Tokens, keys, salts, IVs |
+| Recovery | Given enough output, can recover internal state | Cannot recover internal state |
+
+The danger isn't that `Math.random()` looks non-random — it does look
+random in statistical tests. The danger is that its internal state can be
+recovered. V8's `Math.random` uses the xorshift128+ algorithm. Given
+enough output values, an attacker can reconstruct the internal state and
+predict ALL future values.
+
 ```typescript
+// PRNG: Predictable if you know the state
+// V8 uses xorshift128+ — an attacker can reverse-engineer the state
+// from as few as ~64 observed outputs of Math.random()
+
 // BAD: Generating a session token
 const token = Math.random().toString(36).substring(2);
 // Predictable! An attacker can guess future values.
+
+// BAD: Generating a reset code
+const resetCode = Math.floor(Math.random() * 1000000).toString().padStart(6, '0');
+// An attacker who observes other random values from your app
+// can predict this code.
 
 // GOOD: Generating a session token
 import { randomBytes } from 'node:crypto';
 const token = randomBytes(32).toString('hex');
 // 64 hex characters of cryptographic randomness
+
+// GOOD: Generating a reset code
+import { randomInt } from 'node:crypto';
+const resetCode = randomInt(0, 1000000).toString().padStart(6, '0');
+// Cryptographically random — cannot be predicted
 ```
+
+**Where does a CSPRNG get its entropy?** The operating system collects
+"entropy" from hardware events: keyboard timing, mouse movements, disk
+I/O timing, interrupt timing, and dedicated hardware random number
+generators (RDRAND on Intel CPUs). This entropy is mixed into a pool,
+and the CSPRNG uses this pool to generate unpredictable output. On Linux,
+this is `/dev/urandom`. On Windows, it's `BCryptGenRandom`.
 
 ---
 
