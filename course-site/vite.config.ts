@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import fs from 'fs'
+import path from 'path'
 
 function markdownRawPlugin() {
   return {
@@ -18,4 +19,18 @@ function markdownRawPlugin() {
 
 export default defineConfig({
   plugins: [react(), markdownRawPlugin()],
+  resolve: {
+    alias: {
+      '@content': path.resolve(__dirname, '../backend-mastery'),
+    },
+  },
+  server: {
+    fs: {
+      allow: [
+        // Allow serving files from project root and backend-mastery
+        path.resolve(__dirname),
+        path.resolve(__dirname, '../backend-mastery'),
+      ],
+    },
+  },
 })

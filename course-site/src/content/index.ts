@@ -1,13 +1,14 @@
 /// <reference types="vite/client" />
 
-// Raw imports of all markdown files
-const lessonFiles = import.meta.glob('./**/*.md', { eager: true, import: 'default' }) as Record<string, string>;
+// Raw imports of all markdown files — reads directly from backend-mastery/
+// No duplicate files needed; single source of truth.
+const lessonFiles = import.meta.glob('@content/**/*.md', { eager: true, import: 'default' }) as Record<string, string>;
 
 // Module metadata
 const MODULE_META: Record<string, { title: string; description: string }> = {
   '00': { title: 'Foundations', description: 'TypeScript, Node.js runtime, async patterns, and error handling' },
   '01': { title: 'HTTP & REST APIs', description: 'HTTP from scratch, Express, REST design, validation, middleware' },
-  '02': { title: 'Authentication', description: 'Cryptography, password hashing, JWT, OAuth2, RBAC' },
+  '02': { title: 'Authentication', description: 'Cryptography, password hashing, JWT, OAuth2, RBAC, security attacks, token lifecycle, MFA/WebAuthn, observability' },
   '03': { title: 'PostgreSQL', description: 'Relational theory, SQL, indexes, transactions, connection pooling' },
   '04': { title: 'ORMs & Drizzle', description: 'ORMs, Drizzle, migrations, advanced query patterns' },
   '05': { title: 'WebSockets', description: 'TCP, WebSocket protocol, ws library, scaling real-time connections' },
@@ -32,9 +33,12 @@ export function buildCourse(): Module[] {
     projectPlan?: string;
   }>();
 
-  for (const [path, content] of Object.entries(lessonFiles)) {
-    // path looks like: "./00-foundations/01-typescript-for-backend.md"
-    const parts = path.replace('./', '').split('/');
+  for (const [rawPath, content] of Object.entries(lessonFiles)) {
+    // With @content alias, paths resolve to absolute or alias-prefixed paths.
+    // Extract the part starting from the module directory (e.g., "00-foundations/...")
+    const moduleMatch = rawPath.match(/(\d{2}-[^/]+)\/(.*\.md)$/);
+    if (!moduleMatch) continue;
+    const parts = [moduleMatch[1], ...moduleMatch[2].split('/')];
     if (parts.length < 2) continue;
 
     const moduleDir = parts[0]; // "00-foundations"
