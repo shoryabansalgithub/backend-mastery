@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(for dir:*)",
+      "Bash(do echo:*)",
+      "Read(//d/aspiration/backend-mastery/00-foundations/project/starter/**)",
+      "Bash(done)",
+      "Bash(for m:*)",
+      "Read(//d/aspiration/backend-mastery/$m/project/**)",
+      "Bash(ls:*)",
+      "Bash(for id:*)",
+      "Bash(do)",
+      "Bash(f=\"C:/Users/DELL/AppData/Local/Temp/claude/D--aspiration/164efb80-0a92-4752-84f7-6eaa7bbd8e69/tasks/$id.output\")",
+      "Bash(echo \"=== $id ===\")",
+      "Bash(grep -E '\\\\.md$')",
+      "Bash(echo \"=== $dir/project-2/ ===\")",
+      "Bash(__NEW_LINE_cd11aa7ce88605c1__ ls:*)",
+      "Bash(__NEW_LINE_cd11aa7ce88605c1__ done:*)"
+    ]
+  }
+}
